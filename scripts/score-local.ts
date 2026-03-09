@@ -1,10 +1,11 @@
 import { spawn } from 'node:child_process';
+import type { ChildProcessWithoutNullStreams, SpawnOptions } from 'node:child_process';
 import { once } from 'node:events';
 import process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { navigation, startFlow } from 'lighthouse';
-import puppeteer from 'puppeteer';
+import type { Config } from 'lighthouse';
+import type { Browser, Page } from 'puppeteer';
 
 const DEFAULT_PORT = 4173;
 const TARGET_URL = new URL(process.env.SCORING_BASE_URL ?? `http://127.0.0.1:${DEFAULT_PORT}`);
@@ -15,14 +16,14 @@ const PRODUCT_PATH = process.env.SCORING_PRODUCT_PATH ?? '/product/1';
 const NOT_FOUND_PATH = process.env.SCORING_NOT_FOUND_PATH ?? '/__local-scoring-not-found__';
 const SHOULD_MANAGE_SERVER = TARGET_URL.hostname === '127.0.0.1' || TARGET_URL.hostname === 'localhost';
 
-const PAGE_CONFIG = {
+const PAGE_CONFIG: Config = {
   extends: 'lighthouse:default',
   settings: {
     onlyCategories: ['performance'],
   },
 };
 
-const FLOW_CONFIG = {
+const FLOW_CONFIG: Config = {
   extends: 'lighthouse:default',
   settings: {
     onlyAudits: ['total-blocking-time', 'experimental-interaction-to-next-paint'],
@@ -35,8 +36,58 @@ const SEEDED_USER = {
   password: 'miyamori_aoi',
 };
 
-async function main() {
-  let serverProcess;
+type LighthouseNavigation = typeof import('lighthouse')['navigation'];
+type LighthouseStartFlow = typeof import('lighthouse')['startFlow'];
+
+type ScoreResult = {
+  score: number;
+};
+
+type PageScoreResult = ScoreResult & {
+  name: string;
+};
+
+type FlowScoreResult = ScoreResult & {
+  inp: number;
+  name: string;
+  tbt: number;
+};
+
+type Summary = {
+  flowResults: FlowScoreResult[];
+  pageResults: PageScoreResult[];
+};
+
+type UserCredential = {
+  email: string;
+  password: string;
+};
+
+type PageDefinition = {
+  flags?: {
+    disableStorageReset?: boolean;
+  };
+  name: string;
+  path: string;
+  setup?: (page: Page) => Promise<void>;
+};
+
+type FlowDefinition = {
+  initialPath: string;
+  name: string;
+  perform: (page: Page) => Promise<void>;
+};
+
+type ManagedServerProcess = {
+  child: ChildProcessWithoutNullStreams;
+  output: () => string;
+};
+
+const lighthouseModulePromise = import('lighthouse');
+const puppeteerModulePromise = import('puppeteer');
+
+async function main(): Promise<void> {
+  let serverProcess: ManagedServerProcess | undefined;
 
   try {
     if (SHOULD_MANAGE_SERVER) {
@@ -51,6 +102,10 @@ async function main() {
       logProgress(`use existing target (${BASE_URL})`);
     }
 
+    const [{ navigation, startFlow }, { default: puppeteer }] = await Promise.all([
+      lighthouseModulePromise,
+      puppeteerModulePromise,
+    ]);
     const browser = await puppeteer.launch({
       executablePath: puppeteer.executablePath(),
       headless: true,
@@ -58,8 +113,8 @@ async function main() {
     });
 
     try {
-      const pageResults = await measurePageLandingScores(browser);
-      const flowResults = await measureUserFlowScores(browser);
+      const pageResults = await measurePageLandingScores(browser, navigation);
+      const flowResults = await measureUserFlowScores(browser, startFlow);
 
       printSummary({ pageResults, flowResults });
     } finally {
@@ -70,8 +125,8 @@ async function main() {
   }
 }
 
-async function measurePageLandingScores(browser) {
-  const definitions = [
+async function measurePageLandingScores(browser: Browser, navigation: LighthouseNavigation): Promise<PageScoreResult[]> {
+  const definitions: PageDefinition[] = [
     {
       name: 'ホーム',
       path: '/',
@@ -97,13 +152,13 @@ async function measurePageLandingScores(browser) {
     },
   ];
 
-  const results = [];
+  const results: PageScoreResult[] = [];
 
   for (const definition of definitions) {
     await resetDatabase();
     logProgress(`page start: ${definition.name}`);
     const result = await withIsolatedPage(browser, async (page) => {
-      if (definition.setup) {
+      if (definition.setup !== undefined) {
         await definition.setup(page);
       }
 
@@ -113,13 +168,19 @@ async function measurePageLandingScores(browser) {
       });
       const lhr = runnerResult?.lhr;
 
-      if (!lhr) {
+      if (lhr === undefined) {
         throw new Error(`${definition.name} の Lighthouse 結果を取得できませんでした`);
+      }
+
+      const performanceCategory = lhr.categories['performance'];
+
+      if (performanceCategory === undefined) {
+        throw new Error(`${definition.name} の performance category を取得できませんでした`);
       }
 
       return {
         name: definition.name,
-        score: normalizeScore(lhr.categories.performance.score),
+        score: normalizeScore(performanceCategory.score),
       };
     });
 
@@ -130,8 +191,8 @@ async function measurePageLandingScores(browser) {
   return results;
 }
 
-async function measureUserFlowScores(browser) {
-  const definitions = [
+async function measureUserFlowScores(browser: Browser, startFlow: LighthouseStartFlow): Promise<FlowScoreResult[]> {
+  const definitions: FlowDefinition[] = [
     {
       name: 'ログインする',
       initialPath: '/',
@@ -175,7 +236,7 @@ async function measureUserFlowScores(browser) {
     },
   ];
 
-  const results = [];
+  const results: FlowScoreResult[] = [];
 
   for (const definition of definitions) {
     await resetDatabase();
@@ -199,12 +260,12 @@ async function measureUserFlowScores(browser) {
         .reverse()
         .find((step) => step.lhr.gatherMode === 'timespan');
 
-      if (!timespanStep) {
+      if (timespanStep === undefined) {
         throw new Error(`${definition.name} の timespan 結果を取得できませんでした`);
       }
 
-      const tbt = normalizeScore(timespanStep.lhr.audits['total-blocking-time'].score);
-      const inp = normalizeScore(timespanStep.lhr.audits['experimental-interaction-to-next-paint'].score);
+      const tbt = normalizeScore(timespanStep.lhr.audits['total-blocking-time']?.score ?? null);
+      const inp = normalizeScore(timespanStep.lhr.audits['experimental-interaction-to-next-paint']?.score ?? null);
 
       return {
         name: definition.name,
@@ -221,7 +282,7 @@ async function measureUserFlowScores(browser) {
   return results;
 }
 
-async function signIn(page, user) {
+async function signIn(page: Page, user: UserCredential): Promise<void> {
   await page.waitForSelector('[data-testid="navigate-signin"]', { visible: true });
   await page.click('[data-testid="navigate-signin"]');
   await page.waitForSelector('[data-testid="modal"] #email');
@@ -234,7 +295,7 @@ async function signIn(page, user) {
   await page.waitForSelector('[data-testid="navigate-order"]', { visible: true });
 }
 
-async function signUp(page) {
+async function signUp(page: Page): Promise<void> {
   const uniqueSuffix = Date.now().toString(36);
   const email = `local-score-${uniqueSuffix}@example.com`;
   const password = `Local!Score-${uniqueSuffix}`;
@@ -254,20 +315,25 @@ async function signUp(page) {
   await page.waitForSelector('[data-testid="navigate-order"]', { visible: true });
 }
 
-async function submitOrder(page) {
+async function submitOrder(page: Page): Promise<void> {
   await page.waitForSelector('[data-testid="order-form"] #zipCode');
   await clearAndType(page, '#zipCode', '1500042');
   await page.waitForFunction(() => {
     const prefecture = document.querySelector('#prefecture');
     const city = document.querySelector('#city');
-    return prefecture instanceof HTMLInputElement && city instanceof HTMLInputElement && prefecture.value !== '' && city.value !== '';
+    return (
+      prefecture instanceof HTMLInputElement &&
+      city instanceof HTMLInputElement &&
+      prefecture.value !== '' &&
+      city.value !== ''
+    );
   });
   await clearAndType(page, '#streetAddress', '40番1号 Abema Towers');
   await clickByXPath(page, "//form[@data-testid='order-form']//button[normalize-space()='購入']");
   await waitForPathname(page, '/order/complete');
 }
 
-async function withIsolatedPage(browser, callback) {
+async function withIsolatedPage<T>(browser: Browser, callback: (page: Page) => Promise<T>): Promise<T> {
   const context = await browser.createIncognitoBrowserContext();
   const page = await context.newPage();
   page.setDefaultNavigationTimeout(120_000);
@@ -280,14 +346,13 @@ async function withIsolatedPage(browser, callback) {
   }
 }
 
-async function runScript(scriptName) {
-  await runCommand(resolveRunnerBinary(), [scriptName], {
-    env: process.env,
-  });
+async function runScript(scriptName: string): Promise<void> {
+  await runPackageScript(scriptName);
 }
 
-function startServer() {
-  const serverProcess = spawn(resolveRunnerBinary(), ['start:server:once'], {
+function startServer(): ManagedServerProcess {
+  const [command, args] = getPackageScriptCommand('start:server:once');
+  const child = spawn(command, args, {
     cwd: process.cwd(),
     env: {
       ...process.env,
@@ -297,56 +362,62 @@ function startServer() {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
-  serverProcess.stdout.setEncoding('utf8');
-  serverProcess.stderr.setEncoding('utf8');
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
 
   let output = '';
-  serverProcess.stdout.on('data', (chunk) => {
+  child.stdout.on('data', (chunk: string) => {
     output += chunk;
   });
-  serverProcess.stderr.on('data', (chunk) => {
+  child.stderr.on('data', (chunk: string) => {
     output += chunk;
   });
 
-  serverProcess.output = () => output;
-
-  return serverProcess;
+  return {
+    child,
+    output: () => output,
+  };
 }
 
-async function stopServer(serverProcess) {
-  if (!serverProcess || serverProcess.exitCode != null) {
+async function stopServer(serverProcess: ManagedServerProcess | undefined): Promise<void> {
+  if (serverProcess === undefined || serverProcess.child.exitCode != null) {
+    return;
+  }
+
+  const pid = serverProcess.child.pid;
+  if (pid === undefined) {
     return;
   }
 
   try {
-    process.kill(-serverProcess.pid, 'SIGTERM');
-  } catch (error) {
-    if (error instanceof Error && 'code' in error && error.code === 'ESRCH') {
+    process.kill(-pid, 'SIGTERM');
+  } catch (error: unknown) {
+    if (isErrnoException(error) && error.code === 'ESRCH') {
       return;
     }
     throw error;
   }
 
   await Promise.race([
-    once(serverProcess, 'exit'),
-    delay(10_000).then(() => {
+    once(serverProcess.child, 'exit'),
+    delay(10_000).then(async () => {
       try {
-        process.kill(-serverProcess.pid, 'SIGKILL');
-      } catch (error) {
-        if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) {
+        process.kill(-pid, 'SIGKILL');
+      } catch (error: unknown) {
+        if (!isErrnoException(error) || error.code !== 'ESRCH') {
           throw error;
         }
       }
-      return once(serverProcess, 'exit');
+      await once(serverProcess.child, 'exit');
     }),
   ]);
 }
 
-async function waitForServer(baseUrl, serverProcess) {
+async function waitForServer(baseUrl: string, serverProcess: ManagedServerProcess): Promise<void> {
   const deadline = Date.now() + 180_000;
 
   while (Date.now() < deadline) {
-    if (serverProcess.exitCode != null) {
+    if (serverProcess.child.exitCode != null) {
       throw new Error(`サーバー起動前に終了しました\n${serverProcess.output()}`);
     }
 
@@ -368,7 +439,7 @@ async function waitForServer(baseUrl, serverProcess) {
   throw new Error(`サーバーの起動を待機中にタイムアウトしました\n${serverProcess.output()}`);
 }
 
-async function resetDatabase() {
+async function resetDatabase(): Promise<void> {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const response = await fetch(`${BASE_URL}/initialize`, {
@@ -381,7 +452,7 @@ async function resetDatabase() {
       }
 
       return;
-    } catch (error) {
+    } catch (error: unknown) {
       if (attempt === 3) {
         throw error;
       }
@@ -391,18 +462,18 @@ async function resetDatabase() {
   }
 }
 
-async function clearAndType(page, selector, value) {
+async function clearAndType(page: Page, selector: string, value: string): Promise<void> {
   await page.waitForSelector(selector);
   await page.click(selector, { clickCount: 3 });
   await page.keyboard.press('Backspace');
   await page.type(selector, value);
 }
 
-async function countReviews(page) {
+async function countReviews(page: Page): Promise<number> {
   return page.$$eval('[data-testid="review-list-item"]', (items) => items.length);
 }
 
-async function waitForReviewCount(page, expectedCount) {
+async function waitForReviewCount(page: Page, expectedCount: number): Promise<void> {
   await page.waitForFunction(
     (count) => document.querySelectorAll('[data-testid="review-list-item"]').length >= count,
     {},
@@ -410,31 +481,39 @@ async function waitForReviewCount(page, expectedCount) {
   );
 }
 
-async function waitForModalToClose(page) {
-  await page.waitForFunction(() => !document.querySelector('[data-testid="modal"]'));
+async function waitForModalToClose(page: Page): Promise<void> {
+  await page.waitForFunction(() => document.querySelector('[data-testid="modal"]') === null);
 }
 
-async function waitForPathname(page, pathname) {
+async function waitForPathname(page: Page, pathname: string): Promise<void> {
   await page.waitForFunction((expectedPathname) => window.location.pathname === expectedPathname, {}, pathname);
 }
 
-async function clickByXPath(page, xpath) {
-  const handle = await waitForXPath(page, xpath);
-  await handle.click();
+async function clickByXPath(page: Page, xpath: string): Promise<void> {
+  await page.waitForFunction(
+    (expression) => {
+      const result = document.evaluate(expression, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null)
+        .singleNodeValue;
+      return result instanceof HTMLElement || result instanceof SVGElement;
+    },
+    {},
+    xpath,
+  );
+
+  await page.evaluate((expression) => {
+    const result = document.evaluate(expression, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null)
+      .singleNodeValue;
+
+    if (!(result instanceof HTMLElement) && !(result instanceof SVGElement)) {
+      throw new Error(`要素が見つかりません: ${expression}`);
+    }
+
+    result.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+  }, xpath);
 }
 
-async function waitForXPath(page, xpath) {
-  const handle = await page.waitForXPath(xpath);
-
-  if (!handle) {
-    throw new Error(`要素が見つかりません: ${xpath}`);
-  }
-
-  return handle;
-}
-
-async function runCommand(command, args, options) {
-  await new Promise((resolve, reject) => {
+async function runCommand(command: string, args: string[], options: SpawnOptions): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: process.cwd(),
       stdio: 'inherit',
@@ -453,11 +532,32 @@ async function runCommand(command, args, options) {
   });
 }
 
-function resolveRunnerBinary() {
-  return process.platform === 'win32' ? 'nr.cmd' : 'nr';
+async function runPackageScript(scriptName: string): Promise<void> {
+  const [command, args] = getPackageScriptCommand(scriptName);
+  await runCommand(command, args, {
+    env: process.env,
+  });
 }
 
-function normalizeScore(score) {
+function getPackageScriptCommand(scriptName: string): [string, string[]] {
+  const npmExecPath = process.env.npm_execpath;
+
+  if (typeof npmExecPath === 'string' && npmExecPath !== '') {
+    if (/\.(?:c|m)?js$/u.test(npmExecPath)) {
+      return [process.execPath, [npmExecPath, 'run', scriptName]];
+    }
+
+    return [npmExecPath, ['run', scriptName]];
+  }
+
+  if (process.platform === 'win32') {
+    return ['pnpm.cmd', ['run', scriptName]];
+  }
+
+  return ['pnpm', ['run', scriptName]];
+}
+
+function normalizeScore(score: number | null): number {
   if (typeof score !== 'number') {
     throw new Error('Lighthouse の score を取得できませんでした');
   }
@@ -465,15 +565,15 @@ function normalizeScore(score) {
   return score * 100;
 }
 
-function formatScore(score) {
+function formatScore(score: number): string {
   return score.toFixed(3);
 }
 
-function sumScores(results) {
+function sumScores(results: ScoreResult[]): number {
   return results.reduce((total, result) => total + result.score, 0);
 }
 
-function printSummary({ pageResults, flowResults }) {
+function printSummary({ pageResults, flowResults }: Summary): void {
   const pageTotal = sumScores(pageResults);
   const flowTotal = sumScores(flowResults);
   const overallTotal = pageTotal + flowTotal;
@@ -499,11 +599,15 @@ function printSummary({ pageResults, flowResults }) {
   console.log('');
 }
 
-function logProgress(message) {
+function logProgress(message: string): void {
   console.log(`[score-local] ${message}`);
 }
 
-main().catch((error) => {
+function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error;
+}
+
+main().catch((error: unknown) => {
   console.error(error);
   process.exit(1);
 });

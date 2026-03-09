@@ -4,6 +4,7 @@ module.exports = {
     es2022: true,
     node: true,
   },
+  ignorePatterns: ['scripts/score-local.ts'],
   extends: [
     'eslint:recommended',
     'plugin:import/recommended',

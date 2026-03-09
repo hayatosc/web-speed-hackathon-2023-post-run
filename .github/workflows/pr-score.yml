@@ -1,0 +1,61 @@
+name: PR Score
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+
+permissions:
+  contents: read
+
+jobs:
+  score:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 7.24.3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run local scoring
+        run: pnpm run score:local | tee score-local.txt
+
+      - name: Append job summary
+        if: always()
+        run: |
+          {
+            echo '## Local Scoring'
+            echo ''
+            echo '```text'
+            if [ -f score-local.txt ]; then
+              cat score-local.txt
+            else
+              echo 'score-local.txt was not generated.'
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload scoring artifact
+        if: always() && hashFiles('score-local.txt') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: score-local
+          path: score-local.txt
