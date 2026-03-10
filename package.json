@@ -11,6 +11,7 @@
     "build:tsc:app": "tsc",
     "build:tsc:tools": "tsc -p tsconfig.tools.json",
     "build:vite": "cross-env NODE_ENV=development vite build",
+    "regression:local": "ts-node ./scripts/regression-local.ts",
     "score:local": "ts-node ./scripts/score-local.ts",
     "format": "npm-run-all -s format:*",
     "format:prettier": "prettier --write './**/*.{ts,tsx,js,jsx,json}'",

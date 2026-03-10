@@ -8,5 +8,5 @@
     "target": "ESNext",
     "types": ["node"]
   },
-  "include": ["scripts/score-local.ts"]
+  "include": ["scripts/**/*.ts"]
 }
